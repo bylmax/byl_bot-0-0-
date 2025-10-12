@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_video_manager.py
+    envVars:
+      - key: BOT_API_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHANNEL_LINK
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
