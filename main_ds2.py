@@ -1,4 +1,7 @@
-# bot_video_manager.py
+import smtplib
+import ssl
+from email.message import EmailMessage
+from datetime import datetime, timezone
 import os
 import sqlite3
 import logging
@@ -7,13 +10,11 @@ import time
 import threading
 import requests
 
-# Flask برای endpoint /ping (تا Render یا self-ping بتونه درخواست بزنه)
 from flask import Flask, request
 
 import telebot
-from telebot import types, apihelper
+from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import random
 
 # ---------------- Config / Logging ----------------
 logging.basicConfig(
@@ -27,30 +28,103 @@ API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
 
-# برای جلوگیری از sleep:
-SELF_URL = os.getenv("SELF_URL")  # مثلا: https://mybot.onrender.com
-PING_INTERVAL = int(os.getenv("PING_INTERVAL", "300"))  # پیشفرض 300 ثانیه (5 دقیقه)
-PING_SECRET = os.getenv("PING_SECRET")  # اختیاری؛ اگر تنظیم شود، /ping باید این secret را بگیرد
-FLASK_PORT = int(os.getenv("PORT", "5000"))  # Render مقدار PORT را ست می‌کند
+SELF_URL = os.getenv("SELF_URL")
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", "300"))
+PING_SECRET = os.getenv("PING_SECRET")
+FLASK_PORT = int(os.getenv("PORT", "5000"))
 
-CHANNEL_ID = "-1002984288636"
-CHANNEL_LINK = "https://t.me/channelforfrinds"
+# Self-ping verify option: "1" (default) => verify SSL, "0" => don't verify (for testing)
+SELF_PING_VERIFY = os.getenv("SELF_PING_VERIFY", "1") != "0"
+
+# SMTP env vars (for start email)
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002984288636")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/channelforfrinds")
 
 bot = telebot.TeleBot(API_TOKEN)
-
-# Flask app برای /ping
 ping_app = Flask(__name__)
 
-# لیست دسته‌بندی‌های ثابت برای ویدیوها
 CATEGORIES = [
     "mylf", "step sis", "step mom", "work out", "russian",
     "big ass", "big tits", "free us", "Sweetie Fox R", "foot fetish", "arab", "asian", "anal", "BBC", "None"
 ]
 
-# دیکشنری‌های موقت برای مدیریت وضعیت کاربران
 user_categories = {}
 user_pagination = {}
 user_lucky_search = {}
+
+# ---------------- Email helper ----------------
+def send_start_email(user):
+    """
+    user: telebot.types.User object (message.from_user)
+    ارسال ایمیل شامل username (اگر موجود باشد) یا نام و id، و زمان استارت
+    """
+    smtp_host = SMTP_HOST
+    smtp_port = SMTP_PORT
+    smtp_user = SMTP_USER
+    smtp_pass = SMTP_PASS
+    email_to = EMAIL_TO
+
+    if not (smtp_host and smtp_user and smtp_pass and email_to):
+        logger.warning("SMTP یا EMAIL_TO تنظیم نشده‌اند — ارسال ایمیل غیرفعال است.")
+        return
+
+    # اطلاعات کاربر
+    username = getattr(user, 'username', None)
+    first_name = getattr(user, 'first_name', '')
+    last_name = getattr(user, 'last_name', '')
+    user_id = getattr(user, 'id', None)
+
+    if username:
+        user_ident = f"@{username}"
+    else:
+        user_ident = f"{first_name} {last_name} (id: {user_id})"
+
+    # زمان با timezone محلی به صورت ISO
+    start_time = datetime.now(timezone.utc).astimezone().isoformat()
+
+    subject = f"ربات: کاربر جدید استارت زد — {user_ident}"
+    body = f"""یک کاربر ربات را استارت کرد.
+
+کاربر: {user_ident}
+آی‌دی کاربر: {user_id}
+زمان استارت: {start_time}
+
+این پیام توسط ربات ارسال شده است.
+"""
+
+    try:
+        msg = EmailMessage()
+        msg["From"] = smtp_user
+        msg["To"] = email_to
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        # اگر پورت 465: SSL، در غیر این صورت از STARTTLS استفاده می‌کنیم
+        if smtp_port == 465:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+                server.ehlo()
+                try:
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                except Exception:
+                    logger.debug("STARTTLS failed or not supported, trying plain login")
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+
+        logger.info(f"Start email sent for user {user_ident}")
+    except Exception as e:
+        logger.error(f"خطا در ارسال ایمیل برای کاربر {user_ident}: {e}")
 
 # ---------- Database ----------
 def create_connection():
@@ -61,6 +135,7 @@ def create_connection():
 def create_table():
     conn = create_connection()
     cursor = conn.cursor()
+    # create safe category list for CHECK
     cat_list_sql = ",".join([f"'{c}'" for c in CATEGORIES])
     cursor.execute(f'''
         CREATE TABLE IF NOT EXISTS videos
@@ -76,11 +151,12 @@ def create_table():
 
 # ---------- Helpers for callback-safe category codes ----------
 def encode_category_for_callback(cat_text: str) -> str:
-    return cat_text.replace(" ", "")
+    # replace spaces with double underscore to keep a reversible safe token
+    return "cat" + cat_text.replace(" ", "__")
 
 def decode_category_from_callback(cat_code: str) -> str:
-    if cat_code.startswith("cat") and len(cat_code) > 3:
-        return cat_code[:3] + " " + cat_code[3:]
+    if cat_code.startswith("cat"):
+        return cat_code[3:].replace("__", " ")
     return cat_code
 
 # ---------- Channel join helpers ----------
@@ -103,6 +179,9 @@ def create_join_channel_keyboard():
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
+
+    # اگر می‌خواهید حتی وقتی کاربر عضو نیست نیز ایمیل بزنید،
+    # این بخش را تغییر دهید؛ فعلاً مطابق منطق قبلی فقط وقتی عضو باشد ایمیل می‌زنیم.
     if not is_member(user_id):
         bot.send_message(
             message.chat.id,
@@ -113,9 +192,15 @@ def start_handler(message):
         )
         return
 
+    # ارسال ایمیل در یک ترد جداگانه (تا بلوک نشه)
+    try:
+        threading.Thread(target=send_start_email, args=(message.from_user,), daemon=True).start()
+    except Exception as e:
+        logger.warning(f"Couldn't start email thread: {e}")
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add('تماشای فیلم ها 🎥', '🎲 تماشای شانسی', '/home 🏠')
-    bot.send_message(message.chat.id, "سلام 👋\nبه ربات بیلماکس خوش اومدی ", reply_markup=markup)
+    markup.add('تماشای فیلم ها 🎥', '🎲 تماشای شانسی', '/home 🏠', '📤 ارسال محتوا')
+    bot.send_message(message.chat.id, "سلام 👋\nبه ربات bylmax خوش اومدی ", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'check_membership')
 def check_membership_callback(call):
@@ -258,7 +343,7 @@ def process_category_selection(message):
         bot.reply_to(message, "❌ دسته‌بندی نامعتبر است. لطفاً یکی از گزینه‌های موجود را انتخاب کنید:")
         show_category_selection(message)
 
-# ---------- Viewing videos (with pagination) ----------
+# ---------- Viewing videos (global per-category + pagination) ----------
 @bot.message_handler(func=lambda message: message.text == 'تماشای فیلم ها 🎥')
 def show_my_videos(message):
     user_id = message.from_user.id
@@ -266,10 +351,11 @@ def show_my_videos(message):
         bot.send_message(message.chat.id, '⚠️ برای مشاهده ویدیوها باید در کانال عضو باشید.', reply_markup=create_join_channel_keyboard())
         return
 
+    # نمایش دسته‌بندی‌ها برای مشاهده (کاربر می‌تواند دسته را انتخاب کند و ویدیوهای همه را ببیند)
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     markup.add(*CATEGORIES)
     markup.add('📋 همه ویدیوها', '/home')
-    msg = bot.reply_to(message, "لطفاً دسته‌بندی مورد نظر برای مشاهده ویدیوها را انتخاب کنید:", reply_markup=markup)
+    msg = bot.reply_to(message, "لطفاً دسته‌بندی مورد نظر برای مشاهده ویدیوها را انتخاب کنید (ویدیوهای تمام کاربران نمایش داده می‌شوند):", reply_markup=markup)
     bot.register_next_step_handler(msg, process_category_for_viewing)
 
 def process_category_for_viewing(message):
@@ -292,17 +378,17 @@ def process_category_for_viewing(message):
         chosen = message.text
         if chosen in CATEGORIES:
             user_pagination[user_id]['category'] = chosen
-            videos = get_user_videos_by_category(user_id, chosen)
+            videos = get_videos_by_category(chosen)  # returns (video_id, user_id)
             if videos:
-                send_videos_paginated(user_id, message.chat.id, videos, page=0, page_size=3, category=chosen)
+                send_videos_paginated(user_id, message.chat.id, videos, page=0, page_size=5, category=chosen, global_category=True)
             else:
-                bot.reply_to(message, f"❌ ویدیویی در دسته‌بندی {chosen} ندارید")
+                bot.reply_to(message, f"❌ ویدیویی در دسته‌بندی {chosen} موجود نیست")
                 home(message)
         else:
             bot.reply_to(message, "❌ لطفاً یکی از دسته‌بندی‌های موجود را انتخاب کنید:")
             show_my_videos(message)
 
-def send_videos_paginated(user_id, chat_id, videos, page=0, page_size=10, category=None):
+def send_videos_paginated(user_id, chat_id, videos, page=0, page_size=10, category=None, global_category=False):
     if not videos:
         return
 
@@ -313,15 +399,27 @@ def send_videos_paginated(user_id, chat_id, videos, page=0, page_size=10, catego
 
     for i in range(start_idx, end_idx):
         video_info = videos[i]
+        # video_info might be (video_id, user_id) OR (video_id, category) OR just (video_id,)
+        video_id = None
+        caption_parts = []
         if isinstance(video_info, tuple):
-            video_id = video_info[0]
-            video_category = video_info[1] if len(video_info) > 1 else (category or "N/A")
+            if len(video_info) >= 2:
+                second = video_info[1]
+                if isinstance(second, int):
+                    video_id = video_info[0]
+                    if len(video_info) > 2:
+                        caption_parts.append(f"دسته‌بندی: {video_info[2]}")
+                else:
+                    video_id = video_info[0]
+                    caption_parts.append(f"دسته‌بندی: {second}")
+            else:
+                video_id = video_info[0]
         else:
             video_id = video_info
-            video_category = category or "N/A"
 
+        caption = " - ".join(caption_parts) if caption_parts else (f"دسته‌بندی: {category}" if category else "")
         try:
-            bot.send_video(chat_id, video_id, caption=f"دسته‌بندی: {video_category}")
+            bot.send_video(chat_id, video_id, caption=caption or None)
         except Exception as e:
             logger.error(f"خطا در ارسال ویدیو: {e}")
             bot.send_message(chat_id, f"خطا در نمایش ویدیو: {video_id}")
@@ -330,34 +428,33 @@ def send_videos_paginated(user_id, chat_id, videos, page=0, page_size=10, catego
         markup = types.InlineKeyboardMarkup()
         if category:
             encoded = encode_category_for_callback(category)
-            next_cb = f"next_{encoded}_{page + 1}"
-            next_button = types.InlineKeyboardButton("➡️ 3 تای بعدی", callback_data=next_cb)
-        else:
-            next_cb = f"next_all_{page + 1}"
-            next_button = types.InlineKeyboardButton("➡️ 10 تای بعدی", callback_data=next_cb)
-        markup.add(next_button)
-
-        page_info = f"\n\nصفحه {page + 1} از {total_pages} - نمایش {start_idx + 1} تا {end_idx} از {total_videos} ویدیو"
-        if category:
+            next_cb = f"next|{encoded}|{page + 1}"
+            next_button = types.InlineKeyboardButton("➡️ ویدیوهای بعدی", callback_data=next_cb)
+            markup.add(next_button)
+            page_info = f"\n\nصفحه {page + 1} از {total_pages} - نمایش {start_idx + 1} تا {end_idx} از {total_videos} ویدیو"
             bot.send_message(chat_id, f"ویدیوهای دسته‌بندی {category}{page_info}", reply_markup=markup)
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
             kb.add('تماشای فیلم ها 🎥', '🎲 تماشای شانسی', '/home 🏠')
             bot.send_message(chat_id, "🎬", reply_markup=kb)
         else:
-            bot.send_message(chat_id, f"همه ویدیوهای شما{page_info}", reply_markup=markup)
+            next_cb = f"next|all|{page + 1}"
+            next_button = types.InlineKeyboardButton("➡️ ویدیوهای بعدی", callback_data=next_cb)
+            markup.add(next_button)
+            page_info = f"\n\nصفحه {page + 1} از {total_pages} - نمایش {start_idx + 1} تا {end_idx} از {total_videos} ویدیو"
+            bot.send_message(chat_id, f"همه ویدیوها{page_info}", reply_markup=markup)
     else:
         page_info = f"\n\nصفحه {page + 1} از {total_pages} - نمایش {start_idx + 1} تا {end_idx} از {total_videos} ویدیو"
         if category:
             bot.send_message(chat_id, f"✅ تمام ویدیوهای دسته‌بندی {category} نمایش داده شد.{page_info}")
         else:
-            bot.send_message(chat_id, f"✅ تمام ویدیوهای شما نمایش داده شد.{page_info}")
+            bot.send_message(chat_id, f"✅ تمام ویدیوها نمایش داده شد.{page_info}")
         home_from_id(chat_id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('next_'))
+@bot.callback_query_handler(func=lambda call: call.data.startswith('next|'))
 def handle_next_button(call):
     user_id = call.from_user.id
-    parts = call.data.split('_', 2)
-    if len(parts) < 3:
+    parts = call.data.split('|')
+    if len(parts) != 3:
         bot.answer_callback_query(call.id, "داده نامعتبر.")
         return
 
@@ -383,10 +480,10 @@ def handle_next_button(call):
         if category not in CATEGORIES:
             bot.answer_callback_query(call.id, "دسته‌بندی نامعتبر.")
             return
-        videos = get_user_videos_by_category(user_id, category)
+        videos = get_videos_by_category(category)  # global
         user_pagination[user_id]['all_videos'] = False
         user_pagination[user_id]['category'] = category
-        send_videos_paginated(user_id, call.message.chat.id, videos, page=page, page_size=3, category=category)
+        send_videos_paginated(user_id, call.message.chat.id, videos, page=page, page_size=5, category=category, global_category=True)
 
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -488,9 +585,7 @@ create_table()
 # ---------- Flask / ping endpoint ----------
 @ping_app.route("/ping", methods=["GET"])
 def ping():
-    # اگر secret ست شده، حتما باید secret در query یا header فرستاده شود
     if PING_SECRET:
-        # اول header را چک کن، بعد query
         header_secret = request.headers.get("X-Ping-Secret")
         query_secret = request.args.get("secret")
         if header_secret == PING_SECRET or query_secret == PING_SECRET:
@@ -500,9 +595,7 @@ def ping():
     return "pong", 200
 
 def run_flask():
-    # Flask را در یک thread اجرا می‌کنیم تا Render بتواند /ping را بزند
     try:
-        # host 0.0.0.0 و پورت از env گرفته می‌شود (Render این PORT را ست می‌کند)
         ping_app.run(host="0.0.0.0", port=FLASK_PORT)
     except Exception as e:
         logger.error(f"Flask failed to start: {e}")
@@ -514,14 +607,14 @@ def self_ping_loop():
         return
 
     ping_url = SELF_URL.rstrip("/") + "/ping"
-    logger.info(f"[self-ping] starting. pinging {ping_url} every {PING_INTERVAL} seconds")
+    logger.info(f"[self-ping] starting. pinging {ping_url} every {PING_INTERVAL} seconds (verify={SELF_PING_VERIFY})")
     headers = {}
     if PING_SECRET:
         headers["X-Ping-Secret"] = PING_SECRET
 
     while True:
         try:
-            resp = requests.get(ping_url, timeout=10, headers=headers, params={})
+            resp = requests.get(ping_url, timeout=10, headers=headers, params={}, verify=SELF_PING_VERIFY)
             logger.info(f"[self-ping] {ping_url} -> {resp.status_code}")
         except Exception as e:
             logger.error(f"[self-ping] error: {e}")
@@ -533,17 +626,21 @@ def main():
         logger.info("Starting bot with self-ping and ping endpoint...")
         print("🤖 ربات فعال شد!")
 
-        # 1) راه‌اندازی Flask endpoint در thread جدا (برای /ping)
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
         logger.info("Flask ping endpoint started in background thread.")
 
-        # 2) راه‌اندازی self-ping در thread جدا
         ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
         ping_thread.start()
         logger.info("Self-ping thread started.")
 
-        # 3) شروع polling (مثل قبل)
+        # Remove any existing webhook before starting polling to avoid 409 conflicts
+        try:
+            bot.remove_webhook()
+            logger.info("Removed existing webhook (if any). Starting long polling.")
+        except Exception as e:
+            logger.warning(f"Couldn't remove webhook (maybe none): {e}")
+
         while True:
             try:
                 bot.infinity_polling(timeout=60, long_polling_timeout=60)
